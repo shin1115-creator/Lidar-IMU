@@ -8,19 +8,34 @@ import sys
 import queue
 import bisect
 import select
-import termios
-import tty
+import os
+import socket
 import numpy as np
 
 from rplidar import RPLidar
 import serial
+from serial.tools import list_ports
+
+
+def setup_console_encoding():
+    """Best-effort console encoding setup to reduce mojibake."""
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+    try:
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 # --- 設定 ---
-LIDAR_PORT = '/dev/ttyUSB0'
+LIDAR_PORT = 'COM3' if os.name == 'nt' else '/dev/ttyUSB0'
 LIDAR_BAUD = 256000
 LIDAR_TIMEOUT = 5
 
-IMU_PORT = '/dev/ttyACM0'
+IMU_PORT = 'COM4' if os.name == 'nt' else '/dev/ttyACM0'
 IMU_BAUD = 115200
 
 FRAME_MS = 300    # 変更: 更新間隔を長くして描画コストを下げる（ms）
@@ -28,8 +43,13 @@ RMAX = 5.0
 MAX_POINTS = 1000 # 変更: 表示点数を減らす
 BUFFER_MAX = 3000   # 変更: 全体メモリを抑える（さらに下げ）
 
-IMU_CSV = 'imu_log.csv'
-LIDAR_CSV = 'lidar_with_imu.csv'
+IMU_CSV = '/home/pi-shin/research/imu_log.csv'
+LIDAR_CSV = '/home/pi-shin/research/lidar_with_imu.csv'
+
+# ソケット通信設定
+SOCKET_ENABLED = False  # Trueにするとソケット送信を有効化
+SOCKET_SERVER_IP = '127.0.0.1'  # サーバーIPアドレス（デフォルトはローカル）
+SOCKET_SERVER_PORT = 50000  # サーバーポート
 
 # --- 共有バッファ & ロック ---
 points_buf = collections.deque(maxlen=BUFFER_MAX)   # 各要素: (x,y,dist_m,quality,angle_deg, t_sec)
@@ -43,17 +63,97 @@ angle_lock = threading.Lock()
 # CSV 書き込み用キュー
 csv_queue = queue.Queue(maxsize=2000)   # 大きすぎるとメモリ膨張するので縮小
 
+# ソケット通信用
+socket_lock = threading.Lock()
+socket_conn = None  # グローバルソケット接続
+
+def init_socket_connection(server_ip=SOCKET_SERVER_IP, server_port=SOCKET_SERVER_PORT):
+    """サーバーへのソケット接続を初期化"""
+    global socket_conn
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((server_ip, server_port))
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        with socket_lock:
+            socket_conn = sock
+        print(f"ソケット接続成功: {server_ip}:{server_port}")
+        return sock
+    except Exception as e:
+        print(f"ソケット接続失敗: {e}")
+        return None
+
+def send_track_data(track_data):
+    """トラッキング結果をJSONでサーバーに送信"""
+    global socket_conn
+    if not SOCKET_ENABLED or track_data is None:
+        return
+    try:
+        with socket_lock:
+            if socket_conn is None:
+                return
+            sock = socket_conn
+        
+        for track_id, x, y, vx, vy in track_data:
+            data = {
+                "t": time.time(),
+                "track_id": int(track_id),
+                "x": float(x),
+                "y": float(y),
+                "vx": float(vx),
+                "vy": float(vy)
+            }
+            message = json.dumps(data) + "\n"
+            sock.send(message.encode())
+    except Exception as e:
+        print(f"ソケット送信エラー: {e}")
+        with socket_lock:
+            socket_conn = None
+
+def close_socket():
+    """ソケット接続を閉じる"""
+    global socket_conn
+    with socket_lock:
+        if socket_conn is not None:
+            try:
+                socket_conn.close()
+            except:
+                pass
+            socket_conn = None
+
 # --- クロスプラットフォーム キーボード入力ヘルパー ---
-def _kbhit_linux(timeout=0.0):
-    """stdin に読み取り可能なデータがあれば True を返す（ブロックしない）"""
-    dr, _, _ = select.select([sys.stdin], [], [], timeout)
-    return bool(dr)
+tty = None
+termios = None
 
-def _getwch_linux():
-    """stdin から 1 文字読み取る"""
-    return sys.stdin.read(1)
+if os.name == 'nt':
+    import msvcrt
 
-def imu_reader_thread(port=IMU_PORT, baud=IMU_BAUD, out_csv=IMU_CSV):
+    def _kbhit(timeout=0.0):
+        """Windows: コンソール入力があれば True を返す。"""
+        return msvcrt.kbhit()
+
+    def _getwch():
+        """Windows: 1 文字読み取る。"""
+        ch = msvcrt.getwch()
+        return ch
+else:
+    import tty
+    import termios
+
+    def _kbhit(timeout=0.0):
+        """Linux/Unix: stdin に読み取り可能なデータがあれば True を返す。"""
+        dr, _, _ = select.select([sys.stdin], [], [], timeout)
+        return bool(dr)
+
+    def _getwch():
+        """Linux/Unix: stdin から 1 文字読み取る。"""
+        return sys.stdin.read(1)
+
+def imu_reader_thread(port=None, baud=IMU_BAUD, out_csv=IMU_CSV):
+    if port is None:
+        port = IMU_PORT
+    if not port:
+        print("IMU port is not configured. IMU reader is disabled.")
+        return
     try:
         ser = serial.Serial(port, baud, timeout=1)
     except Exception as e:
@@ -90,56 +190,86 @@ def imu_reader_thread(port=IMU_PORT, baud=IMU_BAUD, out_csv=IMU_CSV):
     except:
         pass
 
-def open_lidar_try_baud(port, baud_list=(256000, 115200), timeout=5):
-    """複数ボーレートを順に試し、正常に get_info()/get_health() が取れたものを返す。
-    見つからなければ例外を投げる。"""
-    last_err = None
-    for b in baud_list:
+def _prepare_lidar_serial_line(port, baud, timeout=1.0):
+    """Low-level serial prep to recover from broken stream sync before RPLidar open."""
+    ser = None
+    try:
+        ser = serial.Serial(port, baudrate=baud, timeout=timeout, dsrdtr=False, rtscts=False)
         try:
-            lidar = RPLidar(port, baudrate=b, timeout=timeout)
+            ser.setDTR(False)
+            ser.setRTS(False)
+        except Exception:
+            pass
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        # stop command then reset command (RPLIDAR protocol)
+        try:
+            ser.write(b'\xA5\x25')
+            time.sleep(0.05)
+            ser.write(b'\xA5\x40')
+            time.sleep(0.05)
+        except Exception:
+            pass
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+    finally:
+        if ser is not None:
             try:
-                info = lidar.get_info()
-                health = lidar.get_health()
-                print(f"LIDAR opened at {b} baud. INFO: {info} HEALTH: {health}")
-                return lidar, b
-            except Exception as e:
-                try:
-                    lidar.stop()
-                except:
-                    pass
-                try:
-                    lidar.stop_motor()
-                except:
-                    pass
-                try:
-                    lidar.disconnect()
-                except:
-                    pass
-                last_err = e
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Cannot open LIDAR on {port} with any baud: {last_err}")
+                ser.close()
+            except Exception:
+                pass
 
-def lidar_reader_thread(port=LIDAR_PORT, baud=LIDAR_BAUD, timeout=LIDAR_TIMEOUT, out_csv=LIDAR_CSV):
+
+def open_lidar_fixed(port, baud, timeout=5):
+    """固定ポート・固定ボーレートで LIDAR を開く。"""
+    print(f"Trying LIDAR on {port} @ {baud}...")
+    _prepare_lidar_serial_line(port, baud, timeout=0.5)
+    lidar = RPLidar(port, baudrate=baud, timeout=timeout)
+    time.sleep(0.5)
+
+    try:
+        serial_obj = getattr(lidar, '_serial', None)
+        if serial_obj is not None:
+            serial_obj.reset_input_buffer()
+            serial_obj.reset_output_buffer()
+    except Exception:
+        pass
+
+    info = lidar.get_info()
+    health = lidar.get_health()
+    print(f"LIDAR opened. INFO: {info} HEALTH: {health}")
+    return lidar
+
+def lidar_reader_thread(port=None, baud=LIDAR_BAUD, timeout=LIDAR_TIMEOUT, out_csv=LIDAR_CSV):
     """LIDAR 読み取りスレッド（Descriptor length mismatch に対して再接続/バッファクリアを行う）"""
     global last_angle
-    backoff = 1.0
+    if port is None:
+        port = LIDAR_PORT
+    backoff = 0.5
     lidar = None
 
     while not stop_event.is_set():
         try:
-            lidar, used_baud = open_lidar_try_baud(port, baud_list=(256000, 115200), timeout=timeout)
+            print(f"Attempting to connect LIDAR on {port}...")
+            lidar = open_lidar_fixed(port, baud, timeout=timeout)
+            print(f"Starting LIDAR motor...")
             lidar.start_motor()
-            time.sleep(0.5)
+            time.sleep(1.0)  # モーター起動完全待機
 
             with open(out_csv, 'a', newline='') as f:
                 writer = csv.writer(f)
                 if f.tell() == 0:
                     writer.writerow(['point_t','x','y','dist_m','quality','angle_deg','imu_t','ax','ay','az','pitch','roll'])
-
+                
+                scan_count = 0
                 for scan in lidar.iter_scans(max_buf_meas=512):
                     if stop_event.is_set():
                         break
+                    
+                    scan_count += 1
+                    if scan_count % 10 == 0:
+                        print(f"  Scan {scan_count} received")
+                    
                     try:
                         serial_obj = getattr(lidar, '_serial', None)
                         if serial_obj is not None and hasattr(serial_obj, 'in_waiting') and serial_obj.in_waiting > 4096:
@@ -151,6 +281,7 @@ def lidar_reader_thread(port=LIDAR_PORT, baud=LIDAR_BAUD, timeout=LIDAR_TIMEOUT,
                                 pass
                     except Exception:
                         pass
+                    
                     scan_t = time.time()
                     for meas in scan:
                         if stop_event.is_set():
@@ -191,21 +322,11 @@ def lidar_reader_thread(port=LIDAR_PORT, baud=LIDAR_BAUD, timeout=LIDAR_TIMEOUT,
             break
 
         except Exception as e:
-            print("LIDAR read error:", e)
+            print(f"LIDAR read error: {e}")
             try:
                 import rplidar
                 if isinstance(e, rplidar.RPLidarException):
-                    try:
-                        serial_obj = getattr(lidar, '_serial', None)
-                        if serial_obj is not None:
-                            try:
-                                serial_obj.reset_input_buffer()
-                                serial_obj.reset_output_buffer()
-                                print("Serial buffers reset.")
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                    print(f"RPLidarException detected: {e}")
             except Exception:
                 pass
 
@@ -230,10 +351,12 @@ def lidar_reader_thread(port=LIDAR_PORT, baud=LIDAR_BAUD, timeout=LIDAR_TIMEOUT,
             if stop_event.is_set():
                 break
 
+            print(f"Retrying in {backoff} seconds...")
             time.sleep(backoff)
-            backoff = min(backoff * 2.0, 8.0)
+            backoff = min(backoff * 1.5, 5.0)
             continue
 
+    print("LIDAR thread ending...")
     stop_event.set()
     try:
         if lidar is not None:
@@ -433,19 +556,22 @@ def process_scan_and_tracks(now=None):
 
 def headless_run(poll_interval=0.2):
     """プロットなしで動作。定期的に状態を表示し、'q' キーで終了。"""
-    print("ヘッドレスモード: 'q' キーで停止、Ctrl+C でも停止できます。")
+    print("Headless mode: press 'q' to stop (Ctrl+C also works).")
     last_print = 0.0
+    fd = None
+    old_settings = None
 
-    # stdin を raw モードに切り替えてノンブロッキング入力を有効化
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
+        if os.name != 'nt' and tty is not None and termios is not None:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+
         while not stop_event.is_set():
-            if _kbhit_linux(timeout=0.0):
-                ch = _getwch_linux()
+            if _kbhit(timeout=0.0):
+                ch = _getwch()
                 if ch in ('q', 'Q', '\x1b', '\x03'):  # q / Q / ESC / Ctrl+C
-                    print("\r\n停止要求を受信しました")
+                    print("\r\nStop requested")
                     stop_event.set()
                     break
             now = time.time()
@@ -455,6 +581,7 @@ def headless_run(poll_interval=0.2):
                     n_imu = len(imu_buf)
                 qsize = csv_queue.qsize()
                 tracks_summary = process_scan_and_tracks(now)
+                send_track_data(tracks_summary)  # トラッキング結果をソケットで送信
                 s = f"\r[{time.strftime('%H:%M:%S')}] points={n_pts} imu={n_imu} csv_q={qsize}"
                 if tracks_summary:
                     s += " | tracks: " + ", ".join(
@@ -467,22 +594,122 @@ def headless_run(poll_interval=0.2):
         stop_event.set()
     finally:
         # 必ず元のターミナル設定を復元する
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if os.name != 'nt' and fd is not None and old_settings is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+def get_available_port_info():
+    """利用可能なシリアルポートの情報を返す。"""
+    infos = []
+    try:
+        for p in list_ports.comports():
+            infos.append({
+                'device': p.device,
+                'description': p.description,
+                'hwid': p.hwid,
+            })
+    except Exception:
+        pass
+    return infos
+
+def _port_exists(port_name, port_infos):
+    if not port_name:
+        return False
+    target = str(port_name).strip().lower()
+    return any(str(p['device']).strip().lower() == target for p in port_infos)
+
+def _format_port_list(port_infos):
+    if not port_infos:
+        return "(none)"
+    lines = []
+    for p in port_infos:
+        lines.append(f"- {p['device']}: {p['description']} [{p['hwid']}]")
+    return "\n".join(lines)
+
+def choose_ports(cli_lidar=None, cli_imu=None):
+    """ポート存在確認と簡易自動割当を行う。"""
+    port_infos = get_available_port_info()
+    lidar_port = cli_lidar if cli_lidar else LIDAR_PORT
+    imu_port = cli_imu if cli_imu else IMU_PORT
+
+    lidar_from_default = cli_lidar is None
+    imu_from_default = cli_imu is None
+
+    available_devices = [p['device'] for p in port_infos]
+    used = set()
+
+    if _port_exists(lidar_port, port_infos):
+        used.add(lidar_port)
+    if _port_exists(imu_port, port_infos):
+        used.add(imu_port)
+
+    if lidar_from_default and not _port_exists(lidar_port, port_infos) and available_devices:
+        lidar_port = available_devices[0]
+        used.add(lidar_port)
+        print(f"LIDAR port auto-selected: {lidar_port}")
+
+    if imu_from_default and not _port_exists(imu_port, port_infos):
+        for dev in available_devices:
+            if dev not in used:
+                imu_port = dev
+                used.add(imu_port)
+                print(f"IMU port auto-selected: {imu_port}")
+                break
+
+    lidar_ok = _port_exists(lidar_port, port_infos)
+    imu_ok = _port_exists(imu_port, port_infos)
+
+    if not lidar_ok or not imu_ok:
+        print("Available serial ports:")
+        print(_format_port_list(port_infos))
+        if not lidar_ok:
+            print(f"LIDAR port not found: {lidar_port}")
+        if not imu_ok:
+            print(f"IMU port not found: {imu_port}")
+
+    return lidar_port if lidar_ok else None, imu_port if imu_ok else None
 
 def main():
-    global LIDAR_PORT, IMU_PORT
-    if len(sys.argv) >= 2:
-        LIDAR_PORT = sys.argv[1]
-    if len(sys.argv) >= 3:
-        IMU_PORT = sys.argv[2]
+    global LIDAR_PORT, IMU_PORT, LIDAR_BAUD
+    setup_console_encoding()
+    cli_lidar = sys.argv[1] if len(sys.argv) >= 2 else None
+    cli_imu = sys.argv[2] if len(sys.argv) >= 3 else None
+    LIDAR_PORT, IMU_PORT = choose_ports(cli_lidar, cli_imu)
 
+    if not LIDAR_PORT:
+        print("LIDAR not found. Please provide correct serial ports via CLI args.")
+        print("Example (Windows): python Lidar_IMU_raspi_2.py COM5 COM6")
+        print("Example (Raspi): python3 Lidar_IMU_raspi_2.py /dev/ttyUSB0 /dev/ttyACM0")
+        return
+    if not IMU_PORT:
+        print("IMU not found. Continuing with IMU disabled.")
+
+    print(f"Using fixed LIDAR settings: {LIDAR_PORT} @ {LIDAR_BAUD}")
+
+    print("=" * 60)
+    print("Startup Info")
+    print("=" * 60)
+    print(f"LIDAR port: {LIDAR_PORT}")
+    print(f"LIDAR baud: {LIDAR_BAUD}")
+    print(f"IMU port: {IMU_PORT if IMU_PORT else '(disabled)'}")
+    print(f"IMU baud: {IMU_BAUD}")
+    print(f"Socket tx: {'on' if SOCKET_ENABLED else 'off'}")
+    print("=" * 60)
+
+    # ソケット接続を初期化
+    if SOCKET_ENABLED:
+        print(f"ソケット接続を試行中: {SOCKET_SERVER_IP}:{SOCKET_SERVER_PORT}")
+        init_socket_connection()
+    
     t_csv = threading.Thread(target=csv_writer_thread, daemon=True)
     t_csv.start()
 
-    t_imu = threading.Thread(target=imu_reader_thread, daemon=True)
+    t_imu = None
+    if IMU_PORT:
+        t_imu = threading.Thread(target=imu_reader_thread, daemon=True)
     t_lidar = threading.Thread(target=lidar_reader_thread, daemon=True)
 
-    t_imu.start()
+    if t_imu is not None:
+        t_imu.start()
     t_lidar.start()
     try:
         headless_run()
@@ -490,11 +717,12 @@ def main():
         stop_event.set()
     finally:
         stop_event.set()
-        t_imu.join(timeout=1)
+        close_socket()  # ソケット接続を閉じる
+        if t_imu is not None:
+            t_imu.join(timeout=1)
         t_lidar.join(timeout=1)
         t_csv.join(timeout=1)
-        print("終了処理完了")
+        print("Shutdown complete")
 
 if __name__ == "__main__":
     main()
-
